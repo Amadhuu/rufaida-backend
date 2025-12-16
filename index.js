@@ -23,6 +23,9 @@ app.use("/api/cart", cartRoutes);
 const orderRoutes = require("./src/routes/orderRoutes");
 app.use("/api/orders", orderRoutes);
 
+const promoCodeRoutes = require("./src/routes/promoCodeRoutes");
+app.use("/api/promo-codes", promoCodeRoutes);
+
 // Basic Route (Test)
 app.get("/", (req, res) => {
   res.send("Rufaida Delivery Backend is running...");
