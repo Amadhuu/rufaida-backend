@@ -1,13 +1,13 @@
 const pool = require("../config/db");
 const { sendOrderStatusNotification } = require("./notificationController");
 
-// CREATE ORDER (customer)
+// CREATE ORDER (customer) - UPDATED WITH PROMO CODE SUPPORT
 exports.createOrder = async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const userId = req.user.id; // from token
-    const { items, total_price, delivery_address } = req.body;
+    const userId = req.user.id;
+    const { items, total_price, delivery_address, promo_code_id, discount_amount } = req.body;
 
     if (!items || items.length === 0) {
       return res.status(400).json({ error: "Order must contain items" });
@@ -15,12 +15,57 @@ exports.createOrder = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // Insert order with default values
+    // If promo code is used, validate and record usage
+    let finalTotal = total_price;
+    let appliedDiscount = 0;
+
+    if (promo_code_id && discount_amount) {
+      // Verify promo code exists and is valid
+      const promoCheck = await client.query(
+        `SELECT * FROM promo_codes WHERE id = $1 AND is_active = true`,
+        [promo_code_id]
+      );
+
+      if (promoCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Invalid promo code" });
+      }
+
+      const promo = promoCheck.rows[0];
+
+      // Check if user already used this promo
+      const usageCheck = await client.query(
+        `SELECT * FROM promo_code_usage WHERE user_id = $1 AND promo_code_id = $2`,
+        [userId, promo_code_id]
+      );
+
+      if (usageCheck.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "You have already used this promo code" });
+      }
+
+      // Check usage limit
+      if (promo.usage_limit && promo.used_count >= promo.usage_limit) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Promo code usage limit reached" });
+      }
+
+      appliedDiscount = parseFloat(discount_amount);
+      finalTotal = total_price - appliedDiscount;
+
+      // Update promo code used count
+      await client.query(
+        `UPDATE promo_codes SET used_count = used_count + 1 WHERE id = $1`,
+        [promo_code_id]
+      );
+    }
+
+    // Insert order
     const orderResult = await client.query(
-      `INSERT INTO orders (user_id, total_price, delivery_address, status, payment_method)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO orders (user_id, total_price, delivery_address, status, payment_method, promo_code_id, discount_amount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
-      [userId, total_price, delivery_address, 'pending', 'cash_on_delivery']
+      [userId, finalTotal, delivery_address, 'pending', 'cash_on_delivery', promo_code_id || null, appliedDiscount]
     );
 
     const orderId = orderResult.rows[0].id;
@@ -32,6 +77,24 @@ exports.createOrder = async (req, res) => {
          VALUES ($1, $2, $3, $4)`,
         [orderId, item.product_id, item.quantity, item.price]
       );
+
+      // Optional: Reduce product stock
+      await client.query(
+        `UPDATE products 
+         SET stock = stock - $1,
+             is_available = CASE WHEN stock - $1 > 0 THEN true ELSE false END
+         WHERE id = $2`,
+        [item.quantity, item.product_id]
+      );
+    }
+
+    // Record promo code usage if used
+    if (promo_code_id && appliedDiscount > 0) {
+      await client.query(
+        `INSERT INTO promo_code_usage (promo_code_id, user_id, order_id, discount_amount)
+         VALUES ($1, $2, $3, $4)`,
+        [promo_code_id, userId, orderId, appliedDiscount]
+      );
     }
 
     // Clear user's cart after successful order
@@ -41,12 +104,15 @@ exports.createOrder = async (req, res) => {
     );
 
     await client.query("COMMIT");
+
+    // Send notification
     await sendOrderStatusNotification(orderId, userId, 'pending');
 
     return res.json({
       message: "Order created successfully",
       order_id: orderId,
-      order: orderResult.rows[0]
+      order: orderResult.rows[0],
+      discount_applied: appliedDiscount
     });
 
   } catch (err) {
@@ -57,6 +123,7 @@ exports.createOrder = async (req, res) => {
     client.release();
   }
 };
+
 
 // GET CUSTOMER ORDERS
 exports.getMyOrders = async (req, res) => {
@@ -240,14 +307,14 @@ exports.startOrder = async (req, res) => {
       return res.status(400).json({ error: "Order not assigned to this rider" });
     }
 
-    await sendOrderStatusNotification(orderId, order.rows[0].user_id, 'rider_started');
-
     await pool.query(
       `UPDATE orders
        SET status = 'rider_started'
        WHERE id = $1`,
       [orderId]
     );
+
+    await sendOrderStatusNotification(orderId, order.rows[0].user_id, 'rider_started');
 
     return res.json({ message: "Order started" });
 
@@ -272,14 +339,14 @@ exports.pickupOrder = async (req, res) => {
       return res.status(400).json({ error: "Order not assigned to this rider" });
     }
 
-    await sendOrderStatusNotification(orderId, order.rows[0].user_id, 'picked_up');
-
     await pool.query(
       `UPDATE orders
        SET status = 'picked_up'
        WHERE id = $1`,
       [orderId]
     );
+
+    await sendOrderStatusNotification(orderId, order.rows[0].user_id, 'picked_up');
 
     return res.json({ message: "Order picked up" });
 
@@ -304,14 +371,14 @@ exports.deliverOrder = async (req, res) => {
       return res.status(400).json({ error: "Order not assigned to this rider" });
     }
     
-    await sendOrderStatusNotification(orderId, order.rows[0].user_id, 'delivered');
-    
     await pool.query(
       `UPDATE orders
        SET status = 'delivered'
        WHERE id = $1`,
       [orderId]
     );
+    
+    await sendOrderStatusNotification(orderId, order.rows[0].user_id, 'delivered');
 
     return res.json({ message: "Order delivered" });
 
