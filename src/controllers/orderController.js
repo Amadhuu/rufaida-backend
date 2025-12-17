@@ -1,4 +1,5 @@
 const pool = require("../config/db");
+const { sendOrderStatusNotification } = require("./notificationController");
 
 // CREATE ORDER (customer)
 exports.createOrder = async (req, res) => {
@@ -40,6 +41,7 @@ exports.createOrder = async (req, res) => {
     );
 
     await client.query("COMMIT");
+    await sendOrderStatusNotification(orderId, userId, 'pending');
 
     return res.json({
       message: "Order created successfully",
@@ -194,6 +196,8 @@ exports.updateStatus = async (req, res) => {
     if (result.rows.length === 0)
       return res.status(404).json({ error: "Order not found" });
 
+    await sendOrderStatusNotification(req.params.id, result.rows[0].user_id, status);
+
     res.json(result.rows[0]);
   } catch (err) {
     console.error("Update status error:", err);
@@ -236,6 +240,8 @@ exports.startOrder = async (req, res) => {
       return res.status(400).json({ error: "Order not assigned to this rider" });
     }
 
+    await sendOrderStatusNotification(orderId, order.rows[0].user_id, 'rider_started');
+
     await pool.query(
       `UPDATE orders
        SET status = 'rider_started'
@@ -266,6 +272,8 @@ exports.pickupOrder = async (req, res) => {
       return res.status(400).json({ error: "Order not assigned to this rider" });
     }
 
+    await sendOrderStatusNotification(orderId, order.rows[0].user_id, 'picked_up');
+
     await pool.query(
       `UPDATE orders
        SET status = 'picked_up'
@@ -295,7 +303,9 @@ exports.deliverOrder = async (req, res) => {
     if (order.rows.length === 0) {
       return res.status(400).json({ error: "Order not assigned to this rider" });
     }
-
+    
+    await sendOrderStatusNotification(orderId, order.rows[0].user_id, 'delivered');
+    
     await pool.query(
       `UPDATE orders
        SET status = 'delivered'
